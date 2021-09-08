@@ -23,6 +23,9 @@
 	use App\Models\PixelLog;
 	use Illuminate\Support\Facades\Validator;
 	use Illuminate\Validation\ValidationException;
+    use App\Services\OrderService;
+    use App\Services\OrdersProductService;
+    use App\Services\PixelLogService;
 
 	class PixelLogProcessor
 	{
@@ -143,10 +146,12 @@
 
 			$this->pixel_log->is_order = false;
 			if ($this->pixel_log->data['ev'] === 'purchase' && !empty($this->pixel_log->data['ed']['order_id']) && !empty($this->pixel_log->data['dataLayer'])) {
+                PixelLogService::validateOrder($this->pixel_log);
 				logger()->debug('Это ваще-заказ в 1 клик');
 				$this->parseCheckoutDataLayerEvent();
 				return true;
 			} elseif ($this->pixel_log->data['ev'] === 'pageload' && !empty($this->pixel_log->data['dataLayer'])) {
+                PixelLogService::validateOrder($this->pixel_log);
 				logger()->debug('Это ваще-заказ');
 				$this->parseDataLayerEvent();
 				return true;
@@ -170,15 +175,6 @@
 					->where('order_id', '=', $order_id)
 					->first() ?? new Order();
 
-			// if ($order->wasRecentlyCreated === false) {
-			//     if (!is_null($order->reestr_id)) {
-			//         return;
-			//     }
-			//     if ($order->status !== 'new') {
-			//         return;
-			//     }
-			// }
-
 			$order->order_id = $order_id;
 			$order->datetime = $this->pixel_log->created_at;
 			$order->pp_id = $this->pixel_log->pp_id;
@@ -197,226 +193,141 @@
 			logger()->debug('Это продажа');
 		}
 
-		public function parseDataLayerEvent()
+		public function parseDataLayerEvent() :bool
 		{
-			$events = $this->pixel_log->data['dataLayer'];
+            $events = $this->pixelLog->data['dataLayer'];
 
-			if (!is_array($events)) {
-				throw new \Exception('dataLayer is not an array');
-			}
 			foreach ($events as $event) {
-				if (!isset($event['event'])) {
-					continue;
-				}
-				if (!isset($event['ecommerce'])) {
-					continue;
-				}
-				if (!isset($event['ecommerce']['purchase'])) {
-					continue;
-				}
 				$purchase = $event['ecommerce']['purchase'];
-
-				$validator = Validator::make($purchase, [
-					'products.*.id' => 'required|string',
-					'products.*.name' => 'required|string',
-					'products.*.price' => 'required|numeric',
-					'products.*.variant' => 'nullable|string',
-					'products.*.category' => 'nullable|string',
-					'products.*.quantity' => 'nullable|numeric|min:1',
-					'actionField.id' => 'required|string',
-					'actionField.action' => 'nullable|string|in:purchase',
-					'actionField.revenue' => 'required|numeric',
-				]);
-
-				if ($validator->fails()) {
-					logger()->debug('Ошибка валидации заказа');
-					throw new ValidationException($validator);
-				}
-
 				$order_id = $purchase['actionField']['id'];
-				$order = Order::query()
-					->where('pp_id', '=', $this->pixel_log->pp_id)
-					->where('order_id', '=', $order_id)
-					->first();
+                $gross_amount = $this->getGrossAmount($purchase['products']);;
+                $productCount = count($purchase['products']);
+                $orderFields = $this->getOrderFields($order_id, $gross_amount, $productCount);
+                $order = OrderService::updateOrCreate($orderFields);
 
-				if (!$order) {
-					logger()->debug('Заказ №' . $order_id . ' не существует, создаем');
-					$order = new Order();
-					$order->pp_id = $this->pixel_log->pp_id;
-					$order->order_id = $order_id;
-					$order->status = 'new';
-				} else {
-					logger()->debug('Заказ №' . $order_id . ' существует, обновляем');
-				}
-				$order->pixel_id = $this->pixel_log->id;
-				$order->datetime = $this->pixel_log->created_at;
-				$order->partner_id = $this->link->partner_id;
-				$order->link_id = $this->link->id;
-				$order->click_id = $this->pixel_log->data['click_id'] ?? null;
-				$order->web_id = $this->pixel_log->data['utm_term'] ?? null;
-				$order->offer_id = $this->link->offer_id;
-				$order->client_id = $this->client->id;
-				$order->gross_amount = 0;
-				foreach ($purchase['products'] as $product_data) {
-					$order->gross_amount += $product_data['price'] * ($product_data['quantity'] ?? 1);
-				}
-				// $order->gross_amount = $purchase['actionField']['revenue'] - ($purchase['actionField']['shipping'] ?? 0);
-				$order->cnt_products = count($purchase['products']);
-				$order->save();
+				logger()->debug('Найдено продуктов: ' . $productCount);
 
-				logger()->debug('Найдено продуктов: ' . count($purchase['products']));
+               $products = OrdersProductService::getProductsByOrderId( $order->order_id, $this->pixel_log->pp_id);
+
 				foreach ($purchase['products'] as $product_data) {
 					$product_id = $product_data['id'];
-					$product = OrdersProduct::query()
-							->where('pp_id', '=', $this->pixel_log->pp_id)
-							->where('order_id', '=', $order->order_id)
-							->where('product_id', '=', $product_id)
-							->first() ?? new OrdersProduct();
 
-					// if ($product->wasRecentlyCreated === false) {
-					//     if (!is_null($product->reestr_id)) {
-					//         return;
-					//     }
-					//     if ($product->status !== 'new') {
-					//         return;
-					//     }
-					// }
+                    $filtered = $products->filter(function ($product) use ($product_id) {
+                        return $product['id'] === $product_id;
+                    });
 
-					$product->pp_id = $this->pixel_log->pp_id;
-					$product->order_id = $order->order_id;
-					$product->parent_id = Order::query()
-						->where('pp_id', '=', $this->pixel_log->pp_id)
-						->where('order_id', '=', $order_id)
-						->first()->id;
-					$product->datetime = $order->datetime;
-					$product->partner_id = $order->partner_id;
-					$product->offer_id = $order->offer_id;
-					$product->link_id = $order->link_id;
-					$product->product_id = $product_id;
-					$product->product_name = trim(($product_data['name'] ?? '') . ' ' . ($product_data['variant'] ?? ''));
-					$product->category = $product_data['category'] ?? null;
-					$product->price = $product_data['price'];
-					$product->quantity = $product_data['quantity'] ?? 1;
-					$product->total = $product->price * $product->quantity;
-					$product->web_id = $order->web_id;
-					$product->click_id = $order->click_id;
-					$product->pixel_id = $order->pixel_id;
-					$product->amount = 0;
-					$product->amount_advert = 0;
-					$product->fee_advert = 0;
-					$product->save();
+                    $product = $filtered->first() ?? new OrdersProduct();
+                    $productFields = $this->getProductFields($order, $product_data, $product);
+                    OrdersProductService::updateOrCreate($product, $productFields);
+
 					logger()->debug('Сохранен продукт: ' . $product->product_name);
 				}
 				$this->pixel_log->is_order = true;
+
 				return true;
 			}
 		}
 
-		public function parseCheckoutDataLayerEvent()
+		public function parseCheckoutDataLayerEvent() :bool
 		{
 			$events = $this->pixel_log->data['dataLayer'];
 
-			if (!is_array($events)) {
-				throw new \Exception('dataLayer is not an array');
-			}
 			foreach ($events as $event) {
-				if (!isset($event['event'])) {
-					continue;
-				}
-				if (!isset($event['ecommerce'])) {
-					continue;
-				}
-				if (!isset($event['ecommerce']['checkout'])) {
-					continue;
-				}
-
 				$purchase = $event['ecommerce']['checkout'];
-				$validator = Validator::make($purchase, [
-					'products.*.id' => 'required|string',
-					'products.*.name' => 'required|string',
-					'products.*.price' => 'required|numeric',
-					'products.*.variant' => 'nullable|string',
-					'products.*.category' => 'nullable|string',
-					'products.*.quantity' => 'nullable|numeric|min:1',
-				]);
-
-				if ($validator->fails()) {
-					logger()->debug('Ошибка валидации заказа');
-					throw new ValidationException($validator);
-				}
 
 				$order_id = $this->pixel_log->data['ed']['order_id'];
-				$order = Order::query()
-					->where('pp_id', '=', $this->pixel_log->pp_id)
-					->where('order_id', '=', $order_id)
-					->first();
+                $grossAmount = $this->getGrossAmount($purchase['products']);;
+                $productCount = count($purchase['products']);
+                $orderFields = $this->getOrderFields($order_id, $grossAmount, $productCount);
+                $order = OrderService::updateOrCreate($orderFields);
 
-				if (!$order) {
-					logger()->debug('Заказ №' . $order_id . ' не существует, создаем');
-					$order = new Order();
-					$order->pp_id = $this->pixel_log->pp_id;
-					$order->order_id = $order_id;
-					$order->status = 'new';
-				} else {
-					logger()->debug('Заказ №' . $order_id . ' существует, обновляем');
-				}
-				$order->pixel_id = $this->pixel_log->id;
-				$order->datetime = $this->pixel_log->created_at;
-				$order->partner_id = $this->link->partner_id;
-				$order->link_id = $this->link->id;
-				$order->click_id = $this->pixel_log->data['click_id'] ?? null;
-				$order->web_id = $this->pixel_log->data['utm_term'] ?? null;
-				$order->offer_id = $this->link->offer_id;
-				$order->client_id = $this->client->id;
-				$order->gross_amount = 0;
-				foreach ($purchase['products'] as $product_data) {
-					$order->gross_amount += $product_data['price'] * ($product_data['quantity'] ?? 1);
-				}
-				// $order->gross_amount = $purchase['actionField']['revenue'] - ($purchase['actionField']['shipping'] ?? 0);
-				$order->cnt_products = count($purchase['products']);
-				$order->save();
+				logger()->debug('Найдено продуктов: ' . $productCount);
 
-				logger()->debug('Найдено продуктов: ' . count($purchase['products']));
+                $products = OrdersProductService::getProductsByOrderId( $order->order_id, $this->pixel_log->pp_id);
+
 				foreach ($purchase['products'] as $product_data) {
 					$product_id = $product_data['id'];
-					$product = OrdersProduct::query()
-							->where('pp_id', '=', $this->pixel_log->pp_id)
-							->where('order_id', '=', $order->order_id)
-							->where('product_id', '=', $product_id)
-							->first() ?? new OrdersProduct();
 
-					// if ($product->wasRecentlyCreated === false) {
-					//     if (!is_null($product->reestr_id)) {
-					//         return;
-					//     }
-					//     if ($product->status !== 'new') {
-					//         return;
-					//     }
-					// }
+                    $filtered = $products->filter(function ($product) use ($product_id) {
+                        return $product['id'] === $product_id;
+                    });
 
-					$product->pp_id = $this->pixel_log->pp_id;
-					$product->order_id = $order->order_id;
-					$product->datetime = $order->datetime;
-					$product->partner_id = $order->partner_id;
-					$product->offer_id = $order->offer_id;
-					$product->link_id = $order->link_id;
-					$product->product_id = $product_id;
-					$product->product_name = trim(($product_data['name'] ?? '') . ' ' . ($product_data['variant'] ?? ''));
-					$product->category = $product_data['category'] ?? null;
-					$product->price = $product_data['price'];
-					$product->quantity = $product_data['quantity'] ?? 1;
-					$product->total = $product->price * $product->quantity;
-					$product->web_id = $order->web_id;
-					$product->click_id = $order->click_id;
-					$product->pixel_id = $order->pixel_id;
-					$product->amount = 0;
-					$product->amount_advert = 0;
-					$product->fee_advert = 0;
-					$product->save();
+                    $product = $filtered->first() ?? new OrdersProduct();
+
+                    $productFields = $this->getProductFields($order, $product_data, $product);
+                    OrdersProductService::updateOrCreate($product, $productFields);
 					logger()->debug('Сохранен продукт: ' . $product->product_name);
 				}
 				$this->pixel_log->is_order = true;
+
 				return true;
 			}
 		}
-	}
+
+        private function getGrossAmount(array $products) :int
+        {
+            $grossAmount = 0;
+            foreach ($products as $product_data) {
+                $grossAmount += $product_data['price'] * ($product_data['quantity'] ?? 1);
+            }
+
+            return $grossAmount;
+        }
+        /**
+         * @param $order
+         * @param $productData
+         * @param OrdersProduct $product
+         * @return array
+         */
+        public function getProductFields($order, $productData, OrdersProduct $product): array
+        {
+            $productFields = [
+                'pp_id' => $this->pixel_log->pp_id,
+                'order_id' => $order->order_id,
+                'parent_id' => $order->id,
+                'datetime' => $order->datetime,
+                'partner_id' => $order->partner_id,
+                'offer_id' => $order->offer_id,
+                'link_id' => $order->link_id,
+                'product_id' => $productData['id'],
+                'product_name' => trim(($productData['name'] ?? '') . ' ' . ($productData['variant'] ?? '')),
+                'category' => $productData['category'] ?? null,
+                'price' => $productData['price'],
+                'quantity' => $productData['quantity'] ?? 1,
+                'total' => $product->price * $product->quantity,
+                'web_id' => $order->web_id,
+                'click_id' => $order->click_id,
+                'pixel_id' => $order->pixel_id,
+                'amount' => 0,
+                'amount_advert' => 0,
+                'fee_advert' => 0,
+            ];
+            return $productFields;
+        }
+
+        /**
+         * @param $order_id
+         * @param $gross_amount
+         * @param int $productCount
+         * @return array
+         */
+        public function getOrderFields($order_id, $gross_amount, int $productCount): array
+        {
+            $orderFields = [
+                'pp_id' => $this->pixel_log->pp_id,
+                'order_id' => $order_id,
+                'status' => 'new',
+                'pixel_id' => $this->pixel_log->id,
+                'datetime' => $this->pixel_log->created_at,
+                'partner_id' => $this->link->partner_id,
+                'link_id' => $this->link->id,
+                'click_id' => $this->pixel_log->data['click_id'] ?? null,
+                'web_id' => $this->pixel_log->data['utm_term'] ?? null,
+                'offer_id' => $this->link->offer_id,
+                'client_id' => $this->client->id,
+                'gross_amount' => $gross_amount,
+                'cnt_products' => $productCount
+            ];
+            return $orderFields;
+        }
+    }
