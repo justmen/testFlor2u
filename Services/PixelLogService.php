@@ -4,7 +4,7 @@ use App\Processors\PixelLog;
 
 class PixelLogService
 {
-    public static function validateOrder(PixelLog $pixelLog) :void
+    public static function validateOrder(PixelLog $pixelLog): void
     {
         $events = $pixelLog->data['dataLayer'];
 
